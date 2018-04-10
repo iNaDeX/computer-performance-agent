@@ -1,5 +1,3 @@
-#define _GNU_SOURCE
-
 #include <unistd.h>
 #include <string.h>
 #include <stdio.h>
@@ -11,6 +9,10 @@
 #include <sys/wait.h>
 
 #define MAX_FILENAME_SIZE 1024
+#define READ_END 0
+#define WRITE_END 1
+#define BUFFER_SIZE 1024
+#define EMPIRICAL_SAMPLE_SIZE 16777216
 
 void print_uname(FILE* fp, struct utsname* u) {
 	fprintf(fp, "%s %s %s %s %s\n",
@@ -18,19 +20,11 @@ void print_uname(FILE* fp, struct utsname* u) {
 }
 
 int main(int argc, char *argv[]) {
-	/*uid_t ruid, euid, suid;
-	getresuid(&ruid, &euid, &suid);
-	printf("start: RUID: %d, EUID: %d, SUID: %d\n",ruid, euid, suid);*/
-	// PERMISSIONS ARE 1000 0 0
-	seteuid(getuid()); // lower the priviledges
-	// PERMISSIONS ARE NOW 1000 1000 0
-	/*getresuid(&ruid, &euid, &suid);
-	printf("lowered: RUID: %d, EUID: %d, SUID: %d\n",ruid, euid, suid);*/
-
 	int c;
 	opterr = 0; /* don’t want getopt() writing to stderr */
 	unsigned long samplingInterval = 30;
 	unsigned long duration = 24*3600;
+	unsigned long spillingInterval = 120;
 	char outputFileName[MAX_FILENAME_SIZE] = "";
     time_t start_time;
     time(&start_time);
@@ -38,7 +32,7 @@ int main(int argc, char *argv[]) {
 
     int res;
     // parse command line arguments
-	while ((c = getopt(argc, argv, "i:d:o:")) != EOF) {
+	while ((c = getopt(argc, argv, "i:s:d:o:")) != EOF) {
 		switch (c) {
 		case 'i':
 			res = strtol(optarg,NULL,10);
@@ -55,10 +49,23 @@ int main(int argc, char *argv[]) {
 		case 'o':
 			strncpy(outputFileName,optarg,MAX_FILENAME_SIZE);
 			break;
+		case 's':
+			res = strtol(optarg,NULL,10);
+			if(res != 0) { // discard conversion errors & invalid value
+				spillingInterval = res;
+			} // else, keep default value
+			break;
 		case '?':
-			fprintf(stderr,"unrecognized option: -%c", optopt);
+			fprintf(stderr,"unrecognized option: -%c\n", optopt);
 			break;
 		}
+	}
+
+	// checking that command line arguments are valid
+	if(spillingInterval<samplingInterval || duration<spillingInterval ||
+			duration%spillingInterval != 0 || spillingInterval%samplingInterval != 0) {
+		fprintf(stderr, "invalid command line arguments, not multiples or not sensible values\n");
+		return -1;
 	}
 
 	// write header line
@@ -69,46 +76,72 @@ int main(int argc, char *argv[]) {
 	print_uname(fp, &unameVal);
 	fclose(fp);
 
+	int summarizeEveryXCollectors = spillingInterval/samplingInterval;
+	char* dataToSummarize = malloc(spillingInterval/samplingInterval*EMPIRICAL_SAMPLE_SIZE*sizeof(char)); // big buffer
+	unsigned long int currentOffset = 0;
+	int currentCollector = 0;
+	int collectorPipe[2]; // pipe for the collector
+	int summarizerPipe[2]; // pipe for the summarizer
 	// at each samplingInterval, while time < duration, collect process data
 	while(time(NULL) < (start_time + duration) ) { // time(NULL) returns current time
-		// spawn process
+		if(pipe(collectorPipe) != 0) { // creates the pipe
+			fprintf(stderr, "error creating the collector pipe\n");
+			return -1;
+		}
+		// spawn collector process
 	    if(fork() == 0){
-	    	seteuid(0); // upgrade permissions to root for the collector process
-	    	// PERMISSIONS ARE 1000 0 0
-	    	/*uid_t ruid, euid, suid;
-	    	getresuid(&ruid, &euid, &suid);
-	    	printf("before exec, child (collector): RUID: %d, EUID: %d, SUID: %d\n",ruid, euid, suid);*/
-			if(freopen(outputFileName,"a", stdout) == NULL) { // for the child, redirect stdout to file
-				fprintf(stderr, "error reopening file !\n");
+	    	close(collectorPipe[READ_END]); // collector only writes
+			if(dup2(collectorPipe[WRITE_END], STDOUT_FILENO) == -1) { // for the child, redirect stdout to pipe
+				fprintf(stderr, "error redirecting stdout for collector !\n");
 				perror(NULL);
 			}
-	        execl("./getData", "./getData", (char*)NULL); // INSIDE EXEC, PERMISSIONS ARE 1000 0 0
+	        execl("./getData", "./getData", (char*)NULL);
 	    }else{ // parent process.
-	        wait(NULL);
+	    	close(collectorPipe[WRITE_END]); // parent only reads
+	    	char buf[BUFFER_SIZE];
+	    	int nbCharactersRead = 0;
+	    	while( (nbCharactersRead = read(collectorPipe[READ_END], buf, sizeof(buf))) > 0) { // while there is data in the pipe or collector not finished
+	    		memcpy(dataToSummarize+currentOffset,buf,nbCharactersRead); // pointer arithmetic
+	    		currentOffset += nbCharactersRead;
+	    	}
+	        wait(NULL); // wait for collector to die
+	        close(collectorPipe[READ_END]); // done reading
+	        currentCollector++;
+	        // if it is time to start the summarizer, start it
+	        if(currentCollector == summarizeEveryXCollectors) {
+	        	// it's time to summarize the data collected
+	    		if(pipe(summarizerPipe) != 0) { // creates the pipe
+	    			fprintf(stderr, "error creating the summarizer pipe\n");
+	    			return -1;
+	    		}
+	        	if(fork() == 0){
+	        		close(summarizerPipe[WRITE_END]); // summarizer only reads from pipe
+	        		if(dup2(summarizerPipe[READ_END], STDIN_FILENO) == -1) { // for the child, redirect stdin to file
+	        			fprintf(stderr, "error redirecting stdin for summarizer !\n");
+	        			perror(NULL);
+	        		}
+	        		if(freopen(outputFileName,"a", stdout) == NULL) { // for the child, also redirect stdout to the same file
+	        			fprintf(stderr, "error reopening file !\n");
+	        			perror(NULL);
+	        		}
+	        		execl("./summarize", "./summarize", (char*)NULL);
+	        	}else{ // parent process.
+	        		close(summarizerPipe[READ_END]); // parent only writes to pipe
+	        		int nbBytesWritten = write(summarizerPipe[WRITE_END], dataToSummarize, currentOffset);
+	        		if(nbBytesWritten != currentOffset) { // failed to write everything
+	        			fprintf(stderr, "failed to write data to summarizer pipe, wrote: %d!\n", nbBytesWritten);
+	        		}
+	        		close(summarizerPipe[WRITE_END]); // done sending data
+	        		wait(NULL);
+	        	}
+	        	currentCollector = 0;
+	        	currentOffset = 0;
+	        }
 	    }
 
 		// sleep X seconds
 		sleep(samplingInterval);
 	}
 
-	// collecting is done, it's time to summarize the data collected
-	//int childPid = fork();
-	if(fork() == 0){
-		// PERMISSIONS ARE STILL LOWERED AT 1000 1000 0
-		/*uid_t ruid, euid, suid;
-		getresuid(&ruid, &euid, &suid);
-		printf("before exec, child (reporter): RUID: %d, EUID: %d, SUID: %d\n",ruid, euid, suid);*/
-		if(freopen(outputFileName,"r", stdin) == NULL) { // for the child, redirect stdin to file
-			fprintf(stderr, "error reopening file !\n");
-			perror(NULL);
-		}
-		if(freopen(outputFileName,"a", stdout) == NULL) { // for the child, also redirect stdout to the same file
-			fprintf(stderr, "error reopening file !\n");
-			perror(NULL);
-		}
-		execl("./summarize", "./summarize", (char*)NULL); // INSIDE EXEC, PERMISSIONS ARE 1000 1000 1000
-	}else{ // parent process.
-		wait(NULL);
-	}
 	return 0;
 }
