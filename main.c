@@ -22,17 +22,19 @@ void print_uname(FILE* fp, struct utsname* u) {
 int main(int argc, char *argv[]) {
 	int c;
 	opterr = 0; /* don’t want getopt() writing to stderr */
-	unsigned long samplingInterval = 30;
+	unsigned long samplingInterval = 10;
 	unsigned long duration = 24*3600;
-	unsigned long spillingInterval = 120;
+	unsigned long spillingInterval = 30;
 	char outputFileName[MAX_FILENAME_SIZE] = "";
     time_t start_time;
     time(&start_time);
-    snprintf(outputFileName,MAX_FILENAME_SIZE,"%ld%s",start_time,"_proc.dat");
+
+	struct utsname unameVal;
+	uname(&unameVal);
 
     int res;
     // parse command line arguments
-	while ((c = getopt(argc, argv, "i:s:d:o:")) != EOF) {
+	while ((c = getopt(argc, argv, "i:s:d:")) != EOF) {
 		switch (c) {
 		case 'i':
 			res = strtol(optarg,NULL,10);
@@ -46,9 +48,9 @@ int main(int argc, char *argv[]) {
 				duration = res;
 			} // else, keep default value
 			break;
-		case 'o':
+		/*case 'o':
 			strncpy(outputFileName,optarg,MAX_FILENAME_SIZE);
-			break;
+			break;*/
 		case 's':
 			res = strtol(optarg,NULL,10);
 			if(res != 0) { // discard conversion errors & invalid value
@@ -68,13 +70,14 @@ int main(int argc, char *argv[]) {
 		return -1;
 	}
 
-	// write header line
-	struct utsname unameVal;
-	uname(&unameVal);
-	FILE* fp = fopen(outputFileName, "w");
-	fprintf(fp, "%ld ", start_time);
-	print_uname(fp, &unameVal);
-	fclose(fp);
+	pid_t pid;
+	// start the server
+	if ((pid = fork()) < 0) {
+		fprintf(stderr, "fork error: %s", strerror(errno));
+		exit(1);
+	} else if (pid == 0) {	/* child */
+		execl("./server", "./server", (char*)NULL);
+	} // no need to wait for it since it is a daemon
 
 	int summarizeEveryXCollectors = spillingInterval/samplingInterval;
 	char* dataToSummarize = malloc(spillingInterval/samplingInterval*EMPIRICAL_SAMPLE_SIZE*sizeof(char)); // big buffer
@@ -110,6 +113,15 @@ int main(int argc, char *argv[]) {
 	        // if it is time to start the summarizer, start it
 	        if(currentCollector == summarizeEveryXCollectors) {
 	        	// it's time to summarize the data collected
+	        	// prepare output file for this spill
+	        	time_t currentTime;
+	        	time(&currentTime);
+	        	snprintf(outputFileName,MAX_FILENAME_SIZE,"%ld%s",currentTime,"_proc.dat"); // create file name
+	        	// write header line
+	        	FILE* fp = fopen(outputFileName, "w");
+	        	fprintf(fp, "%ld ", currentTime);
+	        	print_uname(fp, &unameVal);
+	        	fclose(fp);
 	    		if(pipe(summarizerPipe) != 0) { // creates the pipe
 	    			fprintf(stderr, "error creating the summarizer pipe\n");
 	    			return -1;
