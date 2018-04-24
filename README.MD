@@ -10,6 +10,6 @@ run:
 <ul>
   <li>place getData & summarize executables next to agent program</li>
   <li>place server executable next to agent program</li>
-  <li>for easy testing, just run ./agent<li>
+  <li>for easy testing, just run ./agent</li>
 </ul>
 
