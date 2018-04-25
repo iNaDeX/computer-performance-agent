@@ -85,8 +85,11 @@ int main(int argc, char *argv[]) {
 	int currentCollector = 0;
 	int collectorPipe[2]; // pipe for the collector
 	int summarizerPipe[2]; // pipe for the summarizer
+	time_t loopStartTime,loopEndTime;
+	int timeToSleep;
 	// at each samplingInterval, while time < duration, collect process data
 	while(time(NULL) < (start_time + duration) ) { // time(NULL) returns current time
+		time(&loopStartTime); // record the loop start time
 		if(pipe(collectorPipe) != 0) { // creates the pipe
 			fprintf(stderr, "error creating the collector pipe\n");
 			return -1;
@@ -151,8 +154,12 @@ int main(int argc, char *argv[]) {
 	        }
 	    }
 
-		// sleep X seconds
-		sleep(samplingInterval);
+		time(&loopEndTime); // record end loop time
+		timeToSleep = samplingInterval - (loopEndTime - loopStartTime); // compute time we need to sleep
+		if(timeToSleep > 0) { // it could happen that the loop time > samplingInterval, then we definitely don't want to sleep !
+			sleep(timeToSleep);
+		}
+
 	}
 
 	return 0;
